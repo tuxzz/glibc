@@ -22,3 +22,19 @@ endif
 ifeq ($(subdir),elf)
 sysdep_routines += dl-vdso
 endif
+
+ifeq ($(enable-cet),yes)
+ifeq ($(subdir),elf)
+sysdep_routines += dl-cet-nonshared
+sysdep-dl-routines += dl-cet
+endif
+
+# Add -finstrument-control-flow -mcet to CFLAGS when CET is enabled.
+CFLAGS-.o += -finstrument-control-flow -mcet
+CFLAGS-.os += -finstrument-control-flow -mcet
+CFLAGS-.op += -finstrument-control-flow -mcet
+CFLAGS-.oS += -finstrument-control-flow -mcet
+
+# Compile assembly codes with <cet.h> when CET is enabled.
+asm-CPPFLAGS += -finstrument-control-flow -mcet -include cet.h
+endif
