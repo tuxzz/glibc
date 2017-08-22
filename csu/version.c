@@ -39,7 +39,7 @@ LIBC_ABIS_STRING
 
 #include <unistd.h>
 
-extern void __libc_print_version (void);
+extern void __libc_print_version (void) attribute_hidden;
 void
 __libc_print_version (void)
 {
