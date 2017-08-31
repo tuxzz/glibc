@@ -60,7 +60,8 @@ struct exit_function_list
 extern struct exit_function_list *__exit_funcs attribute_hidden;
 extern struct exit_function_list *__quick_exit_funcs attribute_hidden;
 
-extern struct exit_function *__new_exitfn (struct exit_function_list **listp);
+extern struct exit_function *__new_exitfn (struct exit_function_list **listp)
+  attribute_hidden;
 extern uint64_t __new_exitfn_called attribute_hidden;
 
 extern void __run_exit_handlers (int status,
