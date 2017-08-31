@@ -43,6 +43,7 @@
 
 libc_hidden_def (globfree64)
 
+libc_hidden_def (__glob64)
 versioned_symbol (libc, __glob64, glob64, GLIBC_2_2);
 libc_hidden_ver (__glob64, glob64)
 
