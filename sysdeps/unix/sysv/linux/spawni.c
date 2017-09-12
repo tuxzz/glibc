@@ -124,7 +124,10 @@ __spawni_child (void *arguments)
   struct posix_spawn_args *args = arguments;
   const posix_spawnattr_t *restrict attr = args->attr;
   const posix_spawn_file_actions_t *file_actions = args->fa;
-
+  int p = args->pipe[1];
+  close_nocancel(args->pipe[0]);
+  int ret;
+  
   /* The child must ensure that no signal handler are enabled because it shared
      memory with parent, so the signal disposition must be either SIG_DFL or
      SIG_IGN.  It does by iterating over all signals and although it could
@@ -201,7 +204,16 @@ __spawni_child (void *arguments)
       for (cnt = 0; cnt < file_actions->__used; ++cnt)
 	{
 	  struct __spawn_action *action = &file_actions->__actions[cnt];
-
+        /* Dup the pipe fd onto an unoccupied one to avoid any file		
+	     operation to clobber it.  */		
+	  if ((action->action.close_action.fd == p)
+	      || (action->action.open_action.fd == p)
+	      || (action->action.dup2_action.fd == p))
+	    {
+	      if ((ret = __dup (p)) < 0)
+		goto fail;
+	      p = ret;
+	    }
 	  switch (action->tag)
 	    {
 	    case spawn_do_close:
@@ -275,14 +287,17 @@ __spawni_child (void *arguments)
      script without shebang definition for older posix_spawn versions
      (2.15).  */
   maybe_script_execute (args);
-
+  ret = -errno
 fail:
   /* errno should have an appropriate non-zero value; otherwise,
      there's a bug in glibc or the kernel.  For lack of an error code
      (EINTERNALBUG) describing that, use ECHILD.  Another option would
      be to set args->err to some negative sentinel and have the parent
      abort(), but that seems needlessly harsh.  */
-  args->err = errno ? : ECHILD;
+  ret = -ret
+  if(ret)
+    while (write_not_cancel(p, &ret, sizeof ret) < 0)
+      continue;
   _exit (SPAWN_ERROR);
 }
 
@@ -329,8 +344,8 @@ __spawnix (pid_t * pid, const char *file,
 			MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
   if (__glibc_unlikely (stack == MAP_FAILED))
     {
-      close_not_cancel (args.pipe[0]);
-      close_not_cancel (args.pipe[1]);
+      __close_nocancel (args.pipe[0]);
+      __close_nocancel (args.pipe[1]);
       return errno;
     }
 
@@ -362,7 +377,7 @@ __spawnix (pid_t * pid, const char *file,
   new_pid = CLONE (__spawni_child, STACK (stack, stack_size), stack_size,
 		   CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
 
-  close_not_cancel (args.pipe[1]);
+  __close_nocancel (args.pipe[1]);
 
   if (new_pid > 0)
     {
@@ -376,7 +391,7 @@ __spawnix (pid_t * pid, const char *file,
 
   __munmap (stack, stack_size);
 
-  close_not_cancel (args.pipe[0]);
+  __close_nocancel (args.pipe[0]);
 
   if ((ec == 0) && (pid != NULL))
     *pid = new_pid;
