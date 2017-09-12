@@ -299,6 +299,9 @@ __spawnix (pid_t * pid, const char *file,
   struct posix_spawn_args args;
   int ec;
 
+  if (__pipe2 (args.pipe, O_CLOEXEC))
+    return errno;
+
   /* To avoid imposing hard limits on posix_spawn{p} the total number of
      arguments is first calculated to allocate a mmap to hold all possible
      values.  */
@@ -321,25 +324,21 @@ __spawnix (pid_t * pid, const char *file,
 
   /* Add a slack area for child's stack.  */
   size_t argv_size = (argc * sizeof (void *)) + 512;
-  /* We need at least a few pages in case the compiler's stack checking is
-     enabled.  In some configs, it is known to use at least 24KiB.  We use
-     32KiB to be "safe" from anything the compiler might do.  Besides, the
-     extra pages won't actually be allocated unless they get used.  */
-  argv_size += (32 * 1024);
   size_t stack_size = ALIGN_UP (argv_size, GLRO(dl_pagesize));
   void *stack = __mmap (NULL, stack_size, prot,
 			MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
   if (__glibc_unlikely (stack == MAP_FAILED))
-    return errno;
+    {
+      close_not_cancel (args.pipe[0]);
+      close_not_cancel (args.pipe[1]);
+      return errno;
+    }
 
   /* Disable asynchronous cancellation.  */
   int state;
   __libc_ptf_call (__pthread_setcancelstate,
                    (PTHREAD_CANCEL_DISABLE, &state), 0);
 
-  /* Child must set args.err to something non-negative - we rely on
-     the parent and child sharing VM.  */
-  args.err = -1;
   args.file = file;
   args.exec = exec;
   args.fa = file_actions;
@@ -353,8 +352,9 @@ __spawnix (pid_t * pid, const char *file,
 
   /* The clone flags used will create a new child that will run in the same
      memory space (CLONE_VM) and the execution of calling thread will be
-     suspend until the child calls execve or _exit.
-
+     suspend until the child calls execve or _exit.  These condition as
+     signal below either by pipe write (_exit with SPAWN_ERROR) or
+     a successful execve.
      Also since the calling thread execution will be suspend, there is not
      need for CLONE_SETTLS.  Although parent and child share the same TLS
      namespace, there will be no concurrent access for TLS variables (errno
@@ -362,17 +362,21 @@ __spawnix (pid_t * pid, const char *file,
   new_pid = CLONE (__spawni_child, STACK (stack, stack_size), stack_size,
 		   CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
 
+  close_not_cancel (args.pipe[1]);
+
   if (new_pid > 0)
     {
-      ec = args.err;
-      assert (ec >= 0);
-      if (ec != 0)
-	  __waitpid (new_pid, NULL, 0);
+      if (__read (args.pipe[0], &ec, sizeof ec) != sizeof ec)
+	ec = 0;
+      else
+	__waitpid (new_pid, NULL, 0);
     }
   else
     ec = -new_pid;
 
   __munmap (stack, stack_size);
+
+  close_not_cancel (args.pipe[0]);
 
   if ((ec == 0) && (pid != NULL))
     *pid = new_pid;
