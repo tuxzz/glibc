@@ -124,7 +124,7 @@ __spawni_child (void *arguments)
   int p = args->pipe[1];
   int ret;
 
-  close_not_cancel (args->pipe[0]);
+  __close_nocancel (args->pipe[0]);
 
   /* The child must ensure that no signal handler are enabled because it shared
      memory with parent, so the signal disposition must be either SIG_DFL or
@@ -218,7 +218,7 @@ __spawni_child (void *arguments)
 	    {
 	    case spawn_do_close:
 	      if ((ret =
-		   close_not_cancel (action->action.close_action.fd)) != 0)
+		   __close_nocancel (action->action.close_action.fd)) != 0)
 		{
 		  if (!have_fdlimit)
 		    {
@@ -235,8 +235,8 @@ __spawni_child (void *arguments)
 
 	    case spawn_do_open:
 	      {
-        close_not_cancel (action->action.open_action.fd);
-		ret = open_not_cancel (action->action.open_action.path,
+        __close_nocancel (action->action.open_action.fd);
+		ret = __open_nocancel (action->action.open_action.path,
 				       action->action.
 				       open_action.oflag | O_LARGEFILE,
 				       action->action.open_action.mode);
@@ -253,7 +253,7 @@ __spawni_child (void *arguments)
 			!= action->action.open_action.fd)
 		      goto fail;
 
-		    if ((ret = close_not_cancel (new_fd)) != 0)
+		    if ((ret = __close_nocancel (new_fd)) != 0)
 		      goto fail;
 		  }
 	      }
@@ -335,8 +335,8 @@ __spawnix (pid_t * pid, const char *file,
 			MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
   if (__glibc_unlikely (stack == MAP_FAILED))
     {
-      close_not_cancel (args.pipe[0]);
-      close_not_cancel (args.pipe[1]);
+      __close_nocancel (args.pipe[0]);
+      __close_nocancel (args.pipe[1]);
       return errno;
     }
 
@@ -368,7 +368,7 @@ __spawnix (pid_t * pid, const char *file,
   new_pid = CLONE (__spawni_child, STACK (stack, stack_size), stack_size,
 		   CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
 
-  close_not_cancel (args.pipe[1]);
+  __close_nocancel (args.pipe[1]);
 
   if (new_pid > 0)
     {
@@ -382,7 +382,7 @@ __spawnix (pid_t * pid, const char *file,
 
   __munmap (stack, stack_size);
 
-  close_not_cancel (args.pipe[0]);
+  __close_nocancel (args.pipe[0]);
 
   if ((ec == 0) && (pid != NULL))
     *pid = new_pid;
