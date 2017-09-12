@@ -287,7 +287,7 @@ fail:
   /* Since sizeof errno < PIPE_BUF, the write is atomic. */
   ret = -ret;
   if (ret)
-    while (write_not_cancel (p, &ret, sizeof ret) < 0)
+    while (__write_nocancel (p, &ret, sizeof ret) < 0)
       continue;
   _exit (SPAWN_ERROR);
 }
