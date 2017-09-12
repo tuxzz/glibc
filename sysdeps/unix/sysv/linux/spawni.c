@@ -78,6 +78,7 @@
 
 struct posix_spawn_args
 {
+  int pipe[2];
   sigset_t oldmask;
   const char *file;
   int (*exec) (const char *, char *const *, char *const *);
@@ -87,7 +88,6 @@ struct posix_spawn_args
   ptrdiff_t argc;
   char *const *envp;
   int xflags;
-  int err;
 };
 
 /* Older version requires that shell script without shebang definition
