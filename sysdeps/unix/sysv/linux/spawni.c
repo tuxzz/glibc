@@ -1,5 +1,5 @@
 /* POSIX spawn interface.  Linux version.
-   Copyright (C) 2016-2017 Free Software Foundation, Inc.
+   Copyright (C) 2016 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -17,7 +17,6 @@
    <http://www.gnu.org/licenses/>.  */
 
 #include <spawn.h>
-#include <assert.h>
 #include <fcntl.h>
 #include <paths.h>
 #include <string.h>
@@ -30,8 +29,8 @@
 #include <shlib-compat.h>
 #include <nptl/pthreadP.h>
 #include <dl-sysdep.h>
-#include <libc-pointer-arith.h>
 #include <ldsodefs.h>
+#include <libc-internal.h>
 #include "spawn_int.h"
 
 /* The Linux implementation of posix_spawn{p} uses the clone syscall directly
@@ -45,12 +44,11 @@
    3. Child must synchronize with parent to enforce 2. and to possible
       return execv issues.
 
-   The first issue is solved by blocking all signals in child, even
-   the NPTL-internal ones (SIGCANCEL and SIGSETXID).  The second and
-   third issue is done by a stack allocation in parent, and by using a
-   field in struct spawn_args where the child can write an error
-   code. CLONE_VFORK ensures that the parent does not run until the
-   child has either exec'ed successfully or exited.  */
+   The first issue is solved by blocking all signals in child, even the
+   NPTL-internal ones (SIGCANCEL and SIGSETXID).  The second and third issue
+   is done by a stack allocation in parent and a synchronization with using
+   a pipe or waitpid (in case or error).  The pipe has the advantage of
+   allowing the child the communicate an exec error.  */
 
 
 /* The Unix standard contains a long explanation of the way to signal
@@ -61,18 +59,17 @@
 #define SPAWN_ERROR	127
 
 #ifdef __ia64__
-# define CLONE(__fn, __stackbase, __stacksize, __flags, __args) \
-  __clone2 (__fn, __stackbase, __stacksize, __flags, __args, 0, 0, 0)
+# define CLONE(__fn, __stack, __stacksize, __flags, __args) \
+  __clone2 (__fn, __stack, __stacksize, __flags, __args, 0, 0, 0)
 #else
 # define CLONE(__fn, __stack, __stacksize, __flags, __args) \
   __clone (__fn, __stack, __flags, __args)
 #endif
 
-/* Since ia64 wants the stackbase w/clone2, re-use the grows-up macro.  */
-#if _STACK_GROWS_UP || defined (__ia64__)
-# define STACK(__stack, __stack_size) (__stack)
-#elif _STACK_GROWS_DOWN
+#if _STACK_GROWS_DOWN
 # define STACK(__stack, __stack_size) (__stack + __stack_size)
+#elif _STACK_GROWS_UP
+# define STACK(__stack, __stack_size) (__stack)
 #endif
 
 
@@ -125,9 +122,10 @@ __spawni_child (void *arguments)
   const posix_spawnattr_t *restrict attr = args->attr;
   const posix_spawn_file_actions_t *file_actions = args->fa;
   int p = args->pipe[1];
-  close_nocancel(args->pipe[0]);
   int ret;
-  
+
+  close_not_cancel (args->pipe[0]);
+
   /* The child must ensure that no signal handler are enabled because it shared
      memory with parent, so the signal disposition must be either SIG_DFL or
      SIG_IGN.  It does by iterating over all signals and although it could
@@ -169,12 +167,12 @@ __spawni_child (void *arguments)
   if ((attr->__flags & (POSIX_SPAWN_SETSCHEDPARAM | POSIX_SPAWN_SETSCHEDULER))
       == POSIX_SPAWN_SETSCHEDPARAM)
     {
-      if (__sched_setparam (0, &attr->__sp) == -1)
+      if ((ret = __sched_setparam (0, &attr->__sp)) == -1)
 	goto fail;
     }
   else if ((attr->__flags & POSIX_SPAWN_SETSCHEDULER) != 0)
     {
-      if (__sched_setscheduler (0, attr->__policy, &attr->__sp) == -1)
+      if ((ret = __sched_setscheduler (0, attr->__policy, &attr->__sp)) == -1)
 	goto fail;
     }
 #endif
@@ -185,13 +183,13 @@ __spawni_child (void *arguments)
 
   /* Set the process group ID.  */
   if ((attr->__flags & POSIX_SPAWN_SETPGROUP) != 0
-      && __setpgid (0, attr->__pgrp) != 0)
+      && (ret = __setpgid (0, attr->__pgrp)) != 0)
     goto fail;
 
   /* Set the effective user and group IDs.  */
   if ((attr->__flags & POSIX_SPAWN_RESETIDS) != 0
-      && (local_seteuid (__getuid ()) != 0
-	  || local_setegid (__getgid ()) != 0))
+      && ((ret = local_seteuid (__getuid ())) != 0
+	  || (ret = local_setegid (__getgid ())) != 0))
     goto fail;
 
   /* Execute the file actions.  */
@@ -204,8 +202,9 @@ __spawni_child (void *arguments)
       for (cnt = 0; cnt < file_actions->__used; ++cnt)
 	{
 	  struct __spawn_action *action = &file_actions->__actions[cnt];
-        /* Dup the pipe fd onto an unoccupied one to avoid any file		
-	     operation to clobber it.  */		
+
+	  /* Dup the pipe fd onto an unoccupied one to avoid any file
+	     operation to clobber it.  */
 	  if ((action->action.close_action.fd == p)
 	      || (action->action.open_action.fd == p)
 	      || (action->action.dup2_action.fd == p))
@@ -214,10 +213,12 @@ __spawni_child (void *arguments)
 		goto fail;
 	      p = ret;
 	    }
+
 	  switch (action->tag)
 	    {
 	    case spawn_do_close:
-	      if (__close_nocancel (action->action.close_action.fd) != 0)
+	      if ((ret =
+		   close_not_cancel (action->action.close_action.fd)) != 0)
 		{
 		  if (!have_fdlimit)
 		    {
@@ -234,18 +235,11 @@ __spawni_child (void *arguments)
 
 	    case spawn_do_open:
 	      {
-		/* POSIX states that if fildes was already an open file descriptor,
-		   it shall be closed before the new file is opened.  This avoid
-		   pontential issues when posix_spawn plus addopen action is called
-		   with the process already at maximum number of file descriptor
-		   opened and also for multiple actions on single-open special
-		   paths (like /dev/watchdog).  */
-		__close_nocancel (action->action.open_action.fd);
-
-		int ret = __open_nocancel (action->action.open_action.path,
-					   action->action.
-					   open_action.oflag | O_LARGEFILE,
-					   action->action.open_action.mode);
+        close_not_cancel (action->action.open_action.fd);
+		ret = open_not_cancel (action->action.open_action.path,
+				       action->action.
+				       open_action.oflag | O_LARGEFILE,
+				       action->action.open_action.mode);
 
 		if (ret == -1)
 		  goto fail;
@@ -255,19 +249,19 @@ __spawni_child (void *arguments)
 		/* Make sure the desired file descriptor is used.  */
 		if (ret != action->action.open_action.fd)
 		  {
-		    if (__dup2 (new_fd, action->action.open_action.fd)
+		    if ((ret = __dup2 (new_fd, action->action.open_action.fd))
 			!= action->action.open_action.fd)
 		      goto fail;
 
-		    if (__close_nocancel (new_fd) != 0)
+		    if ((ret = close_not_cancel (new_fd)) != 0)
 		      goto fail;
 		  }
 	      }
 	      break;
 
 	    case spawn_do_dup2:
-	      if (__dup2 (action->action.dup2_action.fd,
-			  action->action.dup2_action.newfd)
+	      if ((ret = __dup2 (action->action.dup2_action.fd,
+				 action->action.dup2_action.newfd))
 		  != action->action.dup2_action.newfd)
 		goto fail;
 	      break;
@@ -280,23 +274,20 @@ __spawni_child (void *arguments)
   __sigprocmask (SIG_SETMASK, (attr->__flags & POSIX_SPAWN_SETSIGMASK)
 		 ? &attr->__ss : &args->oldmask, 0);
 
-  args->err = 0;
   args->exec (args->file, args->argv, args->envp);
 
   /* This is compatibility function required to enable posix_spawn run
      script without shebang definition for older posix_spawn versions
      (2.15).  */
   maybe_script_execute (args);
-  ret = -errno
+
+  ret = -errno;
+
 fail:
-  /* errno should have an appropriate non-zero value; otherwise,
-     there's a bug in glibc or the kernel.  For lack of an error code
-     (EINTERNALBUG) describing that, use ECHILD.  Another option would
-     be to set args->err to some negative sentinel and have the parent
-     abort(), but that seems needlessly harsh.  */
-  ret = -ret
-  if(ret)
-    while (write_not_cancel(p, &ret, sizeof ret) < 0)
+  /* Since sizeof errno < PIPE_BUF, the write is atomic. */
+  ret = -ret;
+  if (ret)
+    while (write_not_cancel (p, &ret, sizeof ret) < 0)
       continue;
   _exit (SPAWN_ERROR);
 }
@@ -338,14 +329,14 @@ __spawnix (pid_t * pid, const char *file,
 	     | ((GL (dl_stack_flags) & PF_X) ? PROT_EXEC : 0));
 
   /* Add a slack area for child's stack.  */
-  size_t argv_size = (argc * sizeof (void *)) + 512;
+  size_t argv_size = (argc * sizeof (void *)) + 512 + (32 * 1024);
   size_t stack_size = ALIGN_UP (argv_size, GLRO(dl_pagesize));
   void *stack = __mmap (NULL, stack_size, prot,
 			MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
   if (__glibc_unlikely (stack == MAP_FAILED))
     {
-      __close_nocancel (args.pipe[0]);
-      __close_nocancel (args.pipe[1]);
+      close_not_cancel (args.pipe[0]);
+      close_not_cancel (args.pipe[1]);
       return errno;
     }
 
@@ -377,7 +368,7 @@ __spawnix (pid_t * pid, const char *file,
   new_pid = CLONE (__spawni_child, STACK (stack, stack_size), stack_size,
 		   CLONE_VM | CLONE_VFORK | SIGCHLD, &args);
 
-  __close_nocancel (args.pipe[1]);
+  close_not_cancel (args.pipe[1]);
 
   if (new_pid > 0)
     {
@@ -391,7 +382,7 @@ __spawnix (pid_t * pid, const char *file,
 
   __munmap (stack, stack_size);
 
-  __close_nocancel (args.pipe[0]);
+  close_not_cancel (args.pipe[0]);
 
   if ((ec == 0) && (pid != NULL))
     *pid = new_pid;
